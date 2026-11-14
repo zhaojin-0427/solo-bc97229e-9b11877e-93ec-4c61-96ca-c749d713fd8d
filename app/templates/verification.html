@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="card">
+  <h2>上传合作方名单并核验</h2>
+  <p class="muted">
+    CSV 表头需包含 <code>study_id</code>（研究编号）、<code>hospital</code>（医院）
+    与 <code>mrn</code>（院内编号）三列；最多 1000 行。
+    核验按<b>提交时已发布的完整分组版本</b>逐行核对，尚无已发布分组时拒绝核验。
+    生成过程不占写事务，期间导入、核对与对照下载照常可用。
+  </p>
+  <form class="inline" method="post" action="{{ url_for('verification_submit') }}"
+        enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <button type="submit">提交核验</button>
+    <a class="btn gray" href="{{ url_for('static', filename='sample_verification.csv') }}">
+      下载核验示例 CSV</a>
+  </form>
+  {% if not has_published %}
+    <p class="reason" style="margin-top:10px">
+      尚无已发布分组：核验会被拒绝。请先在首页导入患者并等待分组发布。
+    </p>
+  {% else %}
+    <p class="muted" style="margin-top:10px">
+      当前最新已发布分组版本：<code>compute_id={{ latest_version }}</code>
+    </p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>核验报告</h2>
+  {% if reports %}
+  <table>
+    <thead><tr>
+      <th>报告#</th><th>文件</th><th>状态</th><th>绑定版本</th>
+      <th>总行数</th><th>一致</th><th>未匹配</th><th>冲突</th><th>格式错误</th>
+      <th>过期</th><th>生成时间</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in reports %}
+      <tr>
+        <td>{{ r.id }}</td>
+        <td>{{ r.filename }}</td>
+        <td><span class="badge b-{{ r.status }}">{{ r.status_label }}</span></td>
+        <td>compute_id {{ r.compute_id }}</td>
+        <td>{{ r.total_rows }}</td>
+        <td>{{ r.ok_rows }}</td>
+        <td>{{ r.unmatched_rows }}</td>
+        <td>{{ r.conflict_rows }}</td>
+        <td>{{ r.invalid_rows }}</td>
+        <td>
+          {% if r.stale %}
+            <span class="badge b-REVOKED">已过期</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>{{ r.created_at }}</td>
+        <td>
+          <a href="{{ url_for('verification_view', report_id=r.id) }}">查看问题行</a>
+          {% if r.status == 'DONE' %}
+            · <a href="{{ url_for('download_verification', report_id=r.id) }}">下载报告</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">暂无核验报告。</p>
+  {% endif %}
+</div>
+
+{% if selected %}
+<div class="card">
+  <h2>
+    报告 #{{ selected.id }} 明细
+    <span class="muted" style="font-weight:normal">
+      · 绑定分组版本 compute_id {{ selected.compute_id }}
+      {% if selected.stale %}
+        · <span class="badge b-REVOKED">已过期</span>
+        分组已更新，本报告仍按原版本展示与下载，不混入新数据
+      {% endif %}
+    </span>
+  </h2>
+  {% if selected.detail %}
+    <p class="reason">{{ selected.detail }}</p>
+  {% endif %}
+  {% if selected.status != 'DONE' %}
+    <p class="muted">该报告生成失败，无逐行结果，也不提供下载。</p>
+  {% else %}
+  <p class="muted">
+    仅显示问题行；一致行已计入统计。
+  </p>
+  <table>
+    <thead><tr>
+      <th>CSV 行</th><th>研究编号</th><th>医院</th><th>院内编号</th>
+      <th>结果</th><th>组号</th><th>涉及行</th><th>涉及组</th><th>说明</th>
+    </tr></thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ row.row_no }}</td>
+        <td>{{ row.study_id }}</td>
+        <td>{{ row.hospital }}</td>
+        <td>{{ row.hospital_mrn }}</td>
+        <td>
+          <span class="badge {% if row.status == 'UNMATCHED' %}b-PENDING
+                {% elif row.status == 'INVALID' %}b-FAILED{% else %}b-RUNNING{% endif %}">
+            {{ row.status_label }}</span>
+        </td>
+        <td>{{ row.group_no if row.group_no is not none else '—' }}</td>
+        <td>{{ row.related_rows }}</td>
+        <td>{{ row.related_groups }}</td>
+        <td class="reason">{{ row.detail }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="9" class="muted">该报告没有未匹配或冲突行。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

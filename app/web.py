@@ -106,6 +106,59 @@ def create_app():
         resp.headers["X-Compute-Id"] = str(state["compute_id"])
         return resp
 
+    # ---- 名单核验 ----
+
+    @app.get("/verification")
+    def verification_view():
+        report_id = request.args.get("report_id", type=int)
+        data = repository.verification_page(report_id)
+        return render_template("verification.html", **data)
+
+    @app.post("/verification")
+    def verification_submit():
+        upload = request.files.get("file")
+        if upload is None or upload.filename == "":
+            flash("请选择要核验的名单 CSV 文件", "error")
+            return redirect(url_for("verification_view"))
+        raw = upload.read()
+        if not raw.strip():
+            flash("上传文件为空", "error")
+            return redirect(url_for("verification_view"))
+        try:
+            report_id = services.verify_csv(upload.filename, raw)
+        except UnicodeDecodeError:
+            flash("文件不是有效的 UTF-8 文本 CSV，核验未执行", "error")
+            return redirect(url_for("verification_view"))
+        except ServiceError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("verification_view"))
+        report = repository.verification_report(report_id)
+        flash(
+            f"核验报告 #{report_id} 已生成（绑定分组版本 "
+            f"compute_id={report['compute_id']}）：一致 {report['ok_rows']} 行，"
+            f"未匹配 {report['unmatched_rows']} 行，"
+            f"冲突 {report['conflict_rows']} 行，"
+            f"格式错误 {report['invalid_rows']} 行。",
+            "info",
+        )
+        return redirect(url_for("verification_view", report_id=report_id))
+
+    @app.get("/download/verification/<int:report_id>.csv")
+    def download_verification(report_id):
+        result = repository.export_verification_csv(report_id)
+        if result is None:
+            flash("该核验报告不存在或已生成失败，无可下载内容", "error")
+            return redirect(url_for("verification_view"))
+        csv_text, report = result
+        resp = Response(csv_text, mimetype="text/csv; charset=utf-8")
+        resp.headers["Content-Disposition"] = (
+            f"attachment; filename=verification_report_{report_id}.csv"
+        )
+        # 报告内容按其绑定的原版本生成，与当前最新版本无关
+        resp.headers["X-Group-Version"] = str(report["compute_id"])
+        resp.headers["X-Report-Stale"] = "1" if report["stale"] else "0"
+        return resp
+
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}

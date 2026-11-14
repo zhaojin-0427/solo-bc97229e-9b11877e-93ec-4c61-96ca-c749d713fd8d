@@ -19,6 +19,7 @@ from . import config, db, groups as group_mod, services
 _stop = threading.Event()
 _started = False
 _lock = threading.Lock()
+_thread = None
 
 
 def mark_unfinished_failed(conn):
@@ -175,8 +176,12 @@ def run_recompute(job):
             return
 
         next_compute = conn.execute(
-            "SELECT COALESCE(MAX(compute_id), 0) + 1 AS n FROM groups"
+            "SELECT COALESCE(MAX(compute_id), 0) + 1 AS n FROM ("
+            "SELECT compute_id FROM groups "
+            "UNION ALL SELECT compute_id FROM group_versions)"
         ).fetchone()["n"]
+        # 先把当前分组写入不可变版本快照，再替换 groups：核验报告据此
+        # 按"提交时"的完整版本复算，新版本发布不影响旧报告内容。
         conn.execute("DELETE FROM groups")
         for comp in components:
             for pid, _h, _m in comp["members"]:
@@ -185,6 +190,20 @@ def run_recompute(job):
                     "VALUES (?, ?, ?)",
                     (comp["group_no"], pid, next_compute),
                 )
+        member_count = sum(len(c["members"]) for c in components)
+        conn.execute(
+            "INSERT INTO group_versions(compute_id, group_count, member_count) "
+            "VALUES (?, ?, ?)",
+            (next_compute, len(components), member_count),
+        )
+        conn.execute(
+            "INSERT INTO group_version_members"
+            "(compute_id, group_no, patient_id, hospital, hospital_mrn) "
+            "SELECT ?, g.group_no, g.patient_id, p.hospital, p.hospital_mrn "
+            "FROM groups g JOIN patients p ON p.id=g.patient_id "
+            "WHERE g.compute_id=?",
+            (next_compute, next_compute),
+        )
         conn.execute(
             "UPDATE jobs SET status='DONE', finished_at=datetime('now'), "
             "detail=? WHERE id=?",
@@ -207,8 +226,6 @@ def _fail(job_id, detail):
 
 
 def _loop():
-    # 启动恢复：未完成任务标失败（成功变动已随 WAL 持久保留）
-    db.write_tx(mark_unfinished_failed)
     while not _stop.is_set():
         processed = False
         try:
@@ -232,15 +249,23 @@ def _loop():
 
 
 def start_worker():
-    global _started
+    global _started, _thread
     with _lock:
         if _started:
             return
         _started = True
     db.init_db()
-    t = threading.Thread(target=_loop, name="background-worker", daemon=True)
-    t.start()
+    # 启动恢复必须在后台线程开始消费任务之前同步完成，否则刚入队的任务
+    # 可能被恢复逻辑误标为"重启未完成"。
+    db.write_tx(mark_unfinished_failed)
+    _thread = threading.Thread(
+        target=_loop, name="background-worker", daemon=True
+    )
+    _thread.start()
 
 
 def stop_worker():
     _stop.set()
+    thread = _thread
+    if thread is not None:
+        thread.join(timeout=5)

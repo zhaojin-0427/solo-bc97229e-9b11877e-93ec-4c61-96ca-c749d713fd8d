@@ -1,7 +1,10 @@
 """应用配置。所有路径可通过环境变量覆盖，便于容器与本地运行。"""
 import os
 
-BASE_DIR = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+# APP_BASE_DIR 默认取仓库根目录（app 包的上一级），容器内核定为 /srv/app。
+BASE_DIR = os.environ.get(
+    "APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 DATA_DIR = os.environ.get("APP_DATA_DIR", os.path.join(BASE_DIR, "data"))
 DB_PATH = os.environ.get("APP_DB_PATH", os.path.join(DATA_DIR, "patients.db"))
 UPLOAD_DIR = os.environ.get("APP_UPLOAD_DIR", os.path.join(DATA_DIR, "uploads"))

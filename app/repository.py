@@ -243,3 +243,135 @@ def export_mapping_csv():
              r["hospital_mrn"], r["compute_id"]]
         )
     return buf.getvalue(), dict(state)
+
+
+# ---- 名单核验 ----
+
+VERIFICATION_STATUS_LABELS = {
+    "OK": "一致",
+    "UNMATCHED": "未匹配",
+    "CONFLICT_GROUP": "同组多研究编号",
+    "CONFLICT_STUDY": "研究编号多组",
+    "INVALID": "格式错误",
+}
+
+
+def _latest_version(conn):
+    """最新一个含成员的分组版本；空分组不视为可用版本。"""
+    return conn.execute(
+        "SELECT MAX(compute_id) AS c FROM group_version_members"
+    ).fetchone()["c"]
+
+
+def _report_dict(row, latest):
+    d = dict(row)
+    d["status_label"] = (
+        "生成失败" if d["status"] == "FAILED" else "已完成"
+    )
+    # 过期按"当前最新已发布版本"动态判定，旧报告内容永远按原版本保留
+    d["stale"] = (
+        d["compute_id"] is not None
+        and d["compute_id"] < (latest or 0)
+    )
+    return d
+
+
+def verification_page(report_id=None):
+    """核验页：报告列表、所选报告问题行、当前版本取自同一个快照。"""
+    with db.Snapshot() as conn:
+        latest = _latest_version(conn)
+        reports = [
+            _report_dict(r, latest)
+            for r in conn.execute(
+                "SELECT id, filename, status, compute_id, total_rows, "
+                "matched_rows, unmatched_rows, invalid_rows, conflict_rows, "
+                "ok_rows, detail, created_at, finished_at "
+                "FROM verification_reports ORDER BY id DESC LIMIT 50"
+            )
+        ]
+        selected = None
+        rows = []
+        if report_id is not None:
+            row = conn.execute(
+                "SELECT id, filename, status, compute_id, total_rows, "
+                "matched_rows, unmatched_rows, invalid_rows, conflict_rows, "
+                "ok_rows, detail, created_at, finished_at "
+                "FROM verification_reports WHERE id=?",
+                (report_id,),
+            ).fetchone()
+            if row is not None:
+                selected = _report_dict(row, latest)
+        elif reports:
+            selected = reports[0]
+        if selected is not None:
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT row_no, study_id, hospital, hospital_mrn, "
+                    "status, group_no, related_rows, related_groups, detail "
+                    "FROM verification_rows WHERE report_id=? "
+                    "ORDER BY row_no",
+                    (selected["id"],),
+                )
+            ]
+            # 页面只列问题行；一致行只计入统计
+            rows = [r for r in rows if r["status"] != "OK"]
+            for r in rows:
+                r["status_label"] = VERIFICATION_STATUS_LABELS.get(
+                    r["status"], r["status"]
+                )
+        return {
+            "reports": reports,
+            "selected": selected,
+            "rows": rows,
+            "latest_version": latest,
+            "has_published": latest is not None,
+        }
+
+
+def export_verification_csv(report_id):
+    """导出整份核验报告。报告不存在或生成失败时返回 None。
+
+    报告与逐行结果都由创建时的同一事务写入且永不改写，因此下载内容
+    恒为提交时绑定版本的完整结果，不会混入新数据。
+    """
+    with db.Snapshot() as conn:
+        report = conn.execute(
+            "SELECT * FROM verification_reports WHERE id=?", (report_id,)
+        ).fetchone()
+        if report is None or report["status"] != "DONE":
+            return None
+        latest = _latest_version(conn)
+        rows = conn.execute(
+            "SELECT row_no, study_id, hospital, hospital_mrn, status, group_no, "
+            "related_rows, related_groups, detail "
+            "FROM verification_rows WHERE report_id=? ORDER BY row_no",
+            (report_id,),
+        ).fetchall()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["group_version", "row_no", "study_id", "hospital", "hospital_mrn",
+         "status", "status_label", "group_no", "related_rows",
+         "related_groups", "detail"]
+    )
+    for r in rows:
+        writer.writerow(
+            [report["compute_id"], r["row_no"], r["study_id"], r["hospital"],
+             r["hospital_mrn"], r["status"],
+             VERIFICATION_STATUS_LABELS.get(r["status"], r["status"]),
+             r["group_no"] if r["group_no"] is not None else "",
+             r["related_rows"], r["related_groups"], r["detail"]]
+        )
+    return buf.getvalue(), _report_dict(report, latest)
+
+
+def verification_report(report_id):
+    with db.Snapshot() as conn:
+        report = conn.execute(
+            "SELECT * FROM verification_reports WHERE id=?", (report_id,)
+        ).fetchone()
+        if report is None:
+            return None
+        return _report_dict(report, _latest_version(conn))

@@ -2,6 +2,7 @@
 # 本地（无 Docker）启动脚本
 set -euo pipefail
 cd "$(dirname "$0")"
+export APP_BASE_DIR="${APP_BASE_DIR:-$(pwd)}"
 export APP_DATA_DIR="${APP_DATA_DIR:-$(pwd)/data}"
 export APP_DB_PATH="${APP_DATA_DIR}/patients.db"
 export APP_UPLOAD_DIR="${APP_DATA_DIR}/uploads"

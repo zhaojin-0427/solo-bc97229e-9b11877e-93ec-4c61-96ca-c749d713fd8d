@@ -64,6 +64,62 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+-- 分组版本快照：每次发布都追加一份不可变成员表，核验报告据此绑定
+-- "提交时"的完整分组版本。当前版本仍由 groups 表表示。
+CREATE TABLE IF NOT EXISTS group_versions (
+    compute_id  INTEGER PRIMARY KEY,
+    group_count INTEGER NOT NULL,
+    member_count INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS group_version_members (
+    compute_id   INTEGER NOT NULL REFERENCES group_versions(compute_id),
+    group_no     INTEGER NOT NULL,
+    patient_id   INTEGER NOT NULL,
+    hospital     TEXT NOT NULL,
+    hospital_mrn TEXT NOT NULL,
+    PRIMARY KEY (compute_id, patient_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gvm_group
+    ON group_version_members(compute_id, group_no);
+CREATE INDEX IF NOT EXISTS idx_gvm_key
+    ON group_version_members(compute_id, hospital, hospital_mrn);
+
+-- 名单核验报告：元数据与逐行结果在同一个写事务内一次性保存。
+CREATE TABLE IF NOT EXISTS verification_reports (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename       TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('DONE','FAILED')),
+    compute_id     INTEGER REFERENCES group_versions(compute_id),
+    total_rows     INTEGER NOT NULL DEFAULT 0,
+    matched_rows   INTEGER NOT NULL DEFAULT 0,
+    unmatched_rows INTEGER NOT NULL DEFAULT 0,
+    invalid_rows   INTEGER NOT NULL DEFAULT 0,
+    conflict_rows  INTEGER NOT NULL DEFAULT 0,
+    ok_rows        INTEGER NOT NULL DEFAULT 0,
+    detail         TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS verification_rows (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id      INTEGER NOT NULL
+                   REFERENCES verification_reports(id) ON DELETE CASCADE,
+    row_no         INTEGER NOT NULL,           -- CSV 物理行号（表头为第 1 行）
+    study_id       TEXT NOT NULL DEFAULT '',
+    hospital       TEXT NOT NULL DEFAULT '',
+    hospital_mrn   TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL,
+    group_no       INTEGER,
+    related_rows   TEXT NOT NULL DEFAULT '',
+    related_groups TEXT NOT NULL DEFAULT '',
+    detail         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_verification_rows_report
+    ON verification_rows(report_id, row_no);
 """
 
 
@@ -88,8 +144,41 @@ def init_db():
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _backfill_group_version(conn)
     finally:
         conn.close()
+
+
+def _backfill_group_version(conn):
+    """兼容旧库：当前已发布分组若还没有版本快照，补写一份。
+
+    版本快照是不可变的历史成员表；核验报告只读取快照，因此即使
+    当前 groups 已被新版本替换，旧报告仍能按原版本复现。
+    """
+    row = conn.execute(
+        "SELECT MAX(compute_id) AS compute_id, COUNT(*) AS members FROM groups"
+    ).fetchone()
+    if not row["members"]:
+        return
+    compute_id = row["compute_id"]
+    exists = conn.execute(
+        "SELECT 1 FROM group_versions WHERE compute_id=?", (compute_id,)
+    ).fetchone()
+    if exists:
+        return
+    conn.execute(
+        "INSERT INTO group_versions(compute_id, group_count, member_count) "
+        "SELECT ?, COUNT(DISTINCT group_no), COUNT(*) FROM groups",
+        (compute_id,),
+    )
+    conn.execute(
+        "INSERT INTO group_version_members"
+        "(compute_id, group_no, patient_id, hospital, hospital_mrn) "
+        "SELECT g.compute_id, g.group_no, p.id, p.hospital, p.hospital_mrn "
+        "FROM groups g JOIN patients p ON p.id=g.patient_id "
+        "WHERE g.compute_id=?",
+        (compute_id,),
+    )
 
 
 def write_tx(fn, retries=config.WRITE_RETRY):
